@@ -219,7 +219,6 @@ __marimo__/
 # latenight-monologues project secrets -- NEVER COMMIT
 # -------------------------------------------------------
 token.json
-state.json
 client_secret*.json
 .env
 # Streamlit
