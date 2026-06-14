@@ -46,7 +46,7 @@ def get_access_token() -> str:
     """Exchange the stored refresh token for a short-lived access token."""
     client_id     = os.environ["YOUTUBE_CLIENT_ID"]
     client_secret = os.environ["YOUTUBE_CLIENT_SECRET"]
-    refresh_token = os.environ["YOUTUBE_REFRESH_TOKEN"]
+    refresh_token = os.environ["YOUTUBE_REFRESH_TOKEN"].strip()
 
     resp = requests.post(TOKEN_URL, data={
         "client_id":     client_id,
@@ -54,12 +54,10 @@ def get_access_token() -> str:
         "refresh_token": refresh_token,
         "grant_type":    "refresh_token",
     }, timeout=30)
-        print(f"DEBUG client_id={client_id[:20]!r} token_len={len(refresh_token)}", flush=True)
-    if not resp.ok:
+        if not resp.ok:
         print(f"Token error {resp.status_code}: {resp.text}", flush=True)
     resp.raise_for_status()
-    return resp.json()["access_token"]
-
+        return resp.json()["access_token"]
 
 def yt_get(access_token: str, endpoint: str, params: dict) -> dict:
     """GET a YouTube Data API v3 endpoint."""
