@@ -1,13 +1,13 @@
 # config.py - Show/playlist configuration. Edit title_filters and exclude_keywords to tune.
 
-TARGET_CHANNEL_ID = "REPLACE_WITH_YOUR_BRAND_CHANNEL_ID"  # From youtube.com/account_advanced
+TARGET_CHANNEL_ID = "UC0rbsni42J4q-utj4z61OBw"  # From youtube.com/account_advanced
 
 SHOWS = [
       {
                 "name": "Jimmy Kimmel Live",
                 "channel_id": "UCa6vGFO9ty8v5KZJXQxdhaw",
                 "uploads_playlist": "UUa6vGFO9ty8v5KZJXQxdhaw",
-                "playlist_id": "",  # FILL IN: playlist ID on your Brand channel
+                "playlist_id": "PLG-wspfcFzusYZoAOzkErgSPhKq4ETmUd",
                 "title_filters": ["monologue"],
                 "exclude_keywords": [],
       },
@@ -15,7 +15,7 @@ SHOWS = [
                 "name": "The Tonight Show Starring Jimmy Fallon",
                 "channel_id": "UC8-Th83bH_thdKZDJCrn88g",
                 "uploads_playlist": "UU8-Th83bH_thdKZDJCrn88g",
-                "playlist_id": "",  # FILL IN
+                "playlist_id": "PLG-wspfcFzuu9GPymaM3qo8muDXSJggtv",
                 "title_filters": ["monologue"],
                 "exclude_keywords": [],
       },
@@ -23,7 +23,7 @@ SHOWS = [
                 "name": "Late Night with Seth Meyers",
                 "channel_id": "UCVTyTA7-g9nopHeHbeuvpRA",
                 "uploads_playlist": "UUVTyTA7-g9nopHeHbeuvpRA",
-                "playlist_id": "",  # FILL IN
+                "playlist_id": "PLG-wspfcFzutOI_my6jt5bY1RDofWPdoX",
                 "title_filters": ["monologue", "a closer look"],
                 "exclude_keywords": [],
       },
@@ -31,7 +31,7 @@ SHOWS = [
                 "name": "The Daily Show",
                 "channel_id": "UCwWhs_6x42TyRM4Wstoq8HA",
                 "uploads_playlist": "UUwWhs_6x42TyRM4Wstoq8HA",
-                "playlist_id": "",  # FILL IN
+                "playlist_id": "PLG-wspfcFzuvu7Poqlce1-O7FVxRE-368",
                 # Main desk commentary clips end with "| The Daily Show".
                 # Negative list excludes field pieces, correspondent franchises, interviews.
                 # Tune exclude_keywords if interview clips slip through.
@@ -47,7 +47,7 @@ SHOWS = [
                 "name": "Real Time with Bill Maher",
                 "channel_id": "UCy6kyFxaMqGtpE3pQTflK8A",
                 "uploads_playlist": "UUy6kyFxaMqGtpE3pQTflK8A",
-                "playlist_id": "",  # FILL IN
+                "playlist_id": "PLG-wspfcFzut6oPHV4wOJXHXiXFG7tF09",
                 "title_filters": ["monologue", "new rules"],
                 "exclude_keywords": [],
       },
