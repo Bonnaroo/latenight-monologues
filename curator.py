@@ -7,267 +7,197 @@ Reads each show's YouTube uploads playlist, filters clips whose titles match
 the show's monologue patterns, and adds matched clips (newest-first) to the
 corresponding playlist on the configured Brand channel.
 
+Auth: uses a stored OAuth refresh token (YOUTUBE_REFRESH_TOKEN env var) so it
+runs headlessly in GitHub Actions with no browser interaction.
+
 Tracked video IDs are persisted in state.json so nothing is added twice.
+In GitHub Actions, state.json is committed back to the repo each run.
+"""
 
-Usage:
-    python curator.py          # single run
-        python curator.py --loop   # poll every POLL_INTERVAL_SECONDS
-        """
-
-import argparse
 import json
 import logging
 import os
 import re
+import sys
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
-import isodate
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+import requests
 
-import config
+from config import SHOWS, TARGET_CHANNEL_ID, POLL_INTERVAL_SECONDS, STATE_FILE
 
 logging.basicConfig(
-      level=logging.INFO,
-      format="%(asctime)s  %(levelname)-8s  %(message)s",
-      datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Auth
+# OAuth helpers (refresh-token flow — no browser required)
 # ---------------------------------------------------------------------------
 
-def get_credentials():
-      """Return valid OAuth2 credentials, refreshing or re-authorising as needed."""
-      creds = None
-      token_path = Path(config.TOKEN_FILE)
-
-    if token_path.exists():
-              creds = Credentials.from_authorized_user_file(str(token_path), config.SCOPES)
-
-    if not creds or not creds.valid:
-              if creds and creds.expired and creds.refresh_token:
-                            log.info("Refreshing access token ...")
-                            creds.refresh(Request())
-    else:
-            log.info("Launching OAuth flow (browser will open) ...")
-                  flow = InstalledAppFlow.from_client_secrets_file(
-                                    os.environ.get("CLIENT_SECRETS_FILE", "client_secret.json"),
-                                    config.SCOPES,
-                  )
-            creds = flow.run_local_server(port=0)
-
-        token_path.write_text(creds.to_json())
-        log.info("Credentials saved to %s", token_path)
-
-    return creds
+TOKEN_URL = "https://oauth2.googleapis.com/token"
+YOUTUBE_API = "https://www.googleapis.com/youtube/v3"
 
 
-def build_youtube():
-      return build("youtube", "v3", credentials=get_credentials())
+def get_access_token() -> str:
+    """Exchange the stored refresh token for a short-lived access token."""
+    client_id     = os.environ["YOUTUBE_CLIENT_ID"]
+    client_secret = os.environ["YOUTUBE_CLIENT_SECRET"]
+    refresh_token = os.environ["YOUTUBE_REFRESH_TOKEN"]
 
-# ---------------------------------------------------------------------------
-# State
-# ---------------------------------------------------------------------------
-
-def load_state():
-      """Return {show_name: set(video_id)} from state file."""
-    path = Path(config.STATE_FILE)
-    if not path.exists():
-              return {}
-          raw = json.loads(path.read_text())
-    return {k: set(v) for k, v in raw.items()}
+    resp = requests.post(TOKEN_URL, data={
+        "client_id":     client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh_token,
+        "grant_type":    "refresh_token",
+    }, timeout=30)
+    resp.raise_for_status()
+    return resp.json()["access_token"]
 
 
-def save_state(state):
-      path = Path(config.STATE_FILE)
-    path.write_text(json.dumps({k: list(v) for k, v in state.items()}, indent=2))
+def yt_get(access_token: str, endpoint: str, params: dict) -> dict:
+    """GET a YouTube Data API v3 endpoint."""
+    headers = {"Authorization": f"Bearer {access_token}"}
+    resp = requests.get(f"{YOUTUBE_API}/{endpoint}", params=params,
+                        headers=headers, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def yt_post(access_token: str, endpoint: str, body: dict) -> dict:
+    """POST to a YouTube Data API v3 endpoint."""
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type":  "application/json",
+    }
+    resp = requests.post(f"{YOUTUBE_API}/{endpoint}", json=body,
+                         headers=headers, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
 
 # ---------------------------------------------------------------------------
-# Title filtering
+# Core logic
 # ---------------------------------------------------------------------------
 
-def matches_show(title: str, show: dict) -> bool:
-      """
-          Return True if `title` matches the show's monologue filter rules.
+def load_state(path: str) -> dict:
+    p = Path(path)
+    if p.exists():
+        return json.loads(p.read_text())
+    return {}
 
-              Logic:
-                    - title (lowercased) must contain at least one string from title_filters (OR)
-                          - title must NOT contain any string from exclude_keywords (AND NOT)
-                              """
+
+def save_state(state: dict, path: str) -> None:
+    Path(path).write_text(json.dumps(state, indent=2))
+
+
+def title_matches(title: str, show: dict) -> bool:
+    """Return True if the title matches any title_filter and no exclude_keyword."""
     t = title.lower()
-
-    # Must match at least one include filter
     if not any(f.lower() in t for f in show["title_filters"]):
-              return False
-
-    # Must not match any exclude keyword
-    if any(k.lower() in t for k in show.get("exclude_keywords", [])):
-              return False
-
+        return False
+    if any(e.lower() in t for e in show.get("exclude_keywords", [])):
+        return False
     return True
 
-# ---------------------------------------------------------------------------
-# YouTube helpers
-# ---------------------------------------------------------------------------
 
-def get_uploads(youtube, uploads_playlist_id: str, max_results: int):
-      """
-          Yield (video_id, title, published_at) tuples from an uploads playlist,
-              newest first, up to max_results items.
-                  """
-      request = youtube.playlistItems().list(
-          part="snippet",
-          playlistId=uploads_playlist_id,
-          maxResults=min(max_results, 50),
-      )
-      response = request.execute()
-
-    for item in response.get("items", []):
-              snippet = item["snippet"]
-              vid_id = snippet["resourceId"]["videoId"]
-              title = snippet["title"]
-              published_at = snippet.get("publishedAt", "")
-              yield vid_id, title, published_at
-
-
-def get_video_duration_seconds(youtube, video_id: str) -> int:
-      """Return the duration in seconds for a single video. Returns 0 on error."""
-      try:
-                resp = youtube.videos().list(part="contentDetails", id=video_id).execute()
-                items = resp.get("items", [])
-                if not items:
-                              return 0
-                          duration_str = items[0]["contentDetails"]["duration"]
-                return int(isodate.parse_duration(duration_str).total_seconds())
-except Exception as exc:
-        log.warning("Could not fetch duration for %s: %s", video_id, exc)
-        return 0
+def fetch_recent_uploads(access_token: str, uploads_playlist_id: str,
+                         max_results: int = 50) -> list[dict]:
+    """Return up to max_results recent items from an uploads playlist."""
+    items, page_token = [], None
+    while True:
+        params = {
+            "part":       "snippet",
+            "playlistId": uploads_playlist_id,
+            "maxResults": 50,
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        data = yt_get(access_token, "playlistItems", params)
+        items.extend(data.get("items", []))
+        if len(items) >= max_results:
+            break
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+    return items[:max_results]
 
 
-def playlist_insert(youtube, playlist_id: str, video_id: str, position: int = 0):
-      """Insert video_id at the top of playlist_id (position 0 = newest on top)."""
-      youtube.playlistItems().insert(
-          part="snippet",
-          body={
-              "snippet": {
-                  "playlistId": playlist_id,
-                  "resourceId": {
-                      "kind": "youtube#video",
-                      "videoId": video_id,
-                  },
-                  "position": position,
-              }
-          },
-      ).execute()
+def add_to_playlist(access_token: str, playlist_id: str, video_id: str) -> None:
+    """Insert a video at position 0 (top) of the target playlist."""
+    yt_post(access_token, "playlistItems", {
+        "snippet": {
+            "playlistId": playlist_id,
+            "resourceId": {
+                "kind":    "youtube#video",
+                "videoId": video_id,
+            },
+            "position": 0,
+        }
+    })
 
-# ---------------------------------------------------------------------------
-# Core run logic
-# ---------------------------------------------------------------------------
 
-def run_once(youtube, state: dict) -> dict:
-      """
-          Iterate over all configured shows, find new monologue clips, add to playlists.
-              Returns updated state dict.
-                  """
-      for show in config.SHOWS:
-                name = show["name"]
-                uploads_pl = show["uploads_playlist"]
-                dest_pl = show["playlist_id"]
+def run_once(access_token: str, state: dict) -> dict:
+    """One full pass: check all shows, add new monologues, return updated state."""
+    for show in SHOWS:
+        name        = show["name"]
+        playlist_id = show.get("playlist_id", "")
+        if not playlist_id:
+            log.warning("%s: no playlist_id configured, skipping", name)
+            continue
 
-          if not dest_pl:
-                        log.warning("[%s] playlist_id not set in config.py -- skipping", name)
-                        continue
+        log.info("Checking %s ...", name)
+        seen = set(state.get(name, []))
 
-        log.info("[%s] Checking uploads playlist %s ...", name, uploads_pl)
-        seen = state.setdefault(name, set())
-
-        # Collect matching unseen videos (preserving upload order = newest first)
-        new_clips = []
         try:
-                      for vid_id, title, published_at in get_uploads(
-                                        youtube, uploads_pl, config.MAX_RESULTS_PER_SHOW
-                      ):
-                                        if vid_id in seen:
-                                                              continue
-                                                          if not matches_show(title, show):
-                                                                                log.debug("[%s] SKIP  %s | %s", name, vid_id, title)
-                                                                                continue
-
-                                        # Optional duration filter
-                                        if config.ENABLE_DURATION_FILTER:
-                                                              dur = get_video_duration_seconds(youtube, vid_id)
-                                                              if dur < config.MIN_DURATION_SECONDS:
-                                                                                        log.info(
-                                                                                                                      "[%s] SKIP (too short: %ds)  %s | %s",
-                                                                                                                      name, dur, vid_id, title,
-                                                                                          )
-                                                                                        seen.add(vid_id)
-                                                                                        continue
-
-                                                          log.info("[%s] MATCH %s | %s", name, vid_id, title)
-                new_clips.append((vid_id, title))
-
-except HttpError as exc:
-            log.error("[%s] API error reading uploads: %s", name, exc)
+            items = fetch_recent_uploads(access_token, show["uploads_playlist"])
+        except Exception as exc:
+            log.error("%s: failed to fetch uploads — %s", name, exc)
             continue
 
-        if not new_clips:
-                      log.info("[%s] No new monologue clips found.", name)
-            continue
+        added = 0
+        # Process oldest-first so newest ends up at position 0
+        for item in reversed(items):
+            snippet  = item.get("snippet", {})
+            video_id = snippet.get("resourceId", {}).get("videoId", "")
+            title    = snippet.get("title", "")
 
-        # Insert newest-first: iterate in reverse so position=0 ends up being
-        # the most recent clip at the top of the playlist.
-        for vid_id, title in reversed(new_clips):
-                      try:
-                                        playlist_insert(youtube, dest_pl, vid_id, position=0)
-                                        seen.add(vid_id)
-                                        log.info("[%s] ADDED  %s | %s", name, vid_id, title)
-except HttpError as exc:
-                log.error("[%s] Failed to add %s: %s", name, vid_id, exc)
+            if not video_id or video_id in seen:
+                continue
+            if not title_matches(title, show):
+                continue
+
+            try:
+                add_to_playlist(access_token, playlist_id, video_id)
+                seen.add(video_id)
+                added += 1
+                log.info("  + %s  [%s]", title, video_id)
+            except Exception as exc:
+                log.error("  ! Failed to add %s: %s", video_id, exc)
+
+        state[name] = list(seen)
+        log.info("%s: added %d new clip(s)", name, added)
 
     return state
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
-def main():
-      parser = argparse.ArgumentParser(description="Late-night monologue curator")
-    parser.add_argument(
-              "--loop",
-              action="store_true",
-              help="Poll continuously every POLL_INTERVAL_SECONDS (default: single run)",
-    )
-    args = parser.parse_args()
+def main() -> None:
+    missing = [v for v in ("YOUTUBE_CLIENT_ID", "YOUTUBE_CLIENT_SECRET",
+                           "YOUTUBE_REFRESH_TOKEN")
+               if not os.environ.get(v)]
+    if missing:
+        log.error("Missing environment variables: %s", ", ".join(missing))
+        sys.exit(1)
 
-    youtube = build_youtube()
-    state = load_state()
-
-    if args.loop:
-              log.info(
-                            "Starting polling loop (interval: %s) ...",
-                            str(timedelta(seconds=config.POLL_INTERVAL_SECONDS)),
-              )
-        while True:
-                      state = run_once(youtube, state)
-            save_state(state)
-            log.info(
-                              "Run complete. Sleeping %s ...",
-                              str(timedelta(seconds=config.POLL_INTERVAL_SECONDS)),
-            )
-            time.sleep(config.POLL_INTERVAL_SECONDS)
-else:
-        state = run_once(youtube, state)
-        save_state(state)
-        log.info("Single run complete.")
+    state = load_state(STATE_FILE)
+    access_token = get_access_token()
+    state = run_once(access_token, state)
+    save_state(state, STATE_FILE)
+    log.info("Done.")
 
 
 if __name__ == "__main__":
-      main()
+    main()
