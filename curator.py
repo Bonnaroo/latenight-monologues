@@ -54,6 +54,7 @@ def get_access_token() -> str:
         "refresh_token": refresh_token,
         "grant_type":    "refresh_token",
     }, timeout=30)
+        print(f"DEBUG client_id={client_id[:20]!r} token_len={len(refresh_token)}", flush=True)
     if not resp.ok:
         print(f"Token error {resp.status_code}: {resp.text}", flush=True)
     resp.raise_for_status()
