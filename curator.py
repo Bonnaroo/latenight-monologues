@@ -1,203 +1,203 @@
 #!/usr/bin/env python3
-"""
-curator.py
-Late-night monologue auto-curator.
+"""YouTube monologue auto-curator.
 
-Reads each show's YouTube uploads playlist, filters clips whose titles match
-the show's monologue patterns, and adds matched clips (newest-first) to the
-corresponding playlist on the configured Brand channel.
-
-Auth: uses a stored OAuth refresh token (YOUTUBE_REFRESH_TOKEN env var) so it
-runs headlessly in GitHub Actions with no browser interaction.
-
-Tracked video IDs are persisted in state.json so nothing is added twice.
-In GitHub Actions, state.json is committed back to the repo each run.
+Fetches uploads for each configured show, filters by title keywords,
+and adds new matching videos to a target playlist. Tracks processed
+video IDs in state.json to avoid duplicates.
 """
 
 import json
-import logging
 import os
-import re
 import sys
-import time
-from datetime import datetime, timedelta
-from pathlib import Path
 
 import requests
 
-from config import SHOWS, TARGET_CHANNEL_ID, POLL_INTERVAL_SECONDS, STATE_FILE
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
-)
-log = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# OAuth helpers (refresh-token flow — no browser required)
-# ---------------------------------------------------------------------------
+from config import SHOWS
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
-YOUTUBE_API = "https://www.googleapis.com/youtube/v3"
+PLAYLIST_ITEMS_URL = "https://www.googleapis.com/youtube/v3/playlistItems"
+STATE_FILE = "state.json"
 
 
-def get_access_token() -> str:
-    """Exchange the stored refresh token for a short-lived access token."""
-    client_id     = os.environ["YOUTUBE_CLIENT_ID"]
-    client_secret = os.environ["YOUTUBE_CLIENT_SECRET"]
-    refresh_token = os.environ["YOUTUBE_REFRESH_TOKEN"].strip()
+def get_access_token():
+    """Exchange the refresh token for a short-lived access token."""
+    client_id = os.environ.get("YOUTUBE_CLIENT_ID")
+    client_secret = os.environ.get("YOUTUBE_CLIENT_SECRET")
+    refresh_token = os.environ.get("YOUTUBE_REFRESH_TOKEN")
 
-    resp = requests.post(TOKEN_URL, data={
-        "client_id":     client_id,
+    if not all([client_id, client_secret, refresh_token]):
+        print("Missing one or more required env vars: "
+              "YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, "
+              "YOUTUBE_REFRESH_TOKEN", file=sys.stderr)
+        sys.exit(1)
+
+    payload = {
+        "client_id": client_id,
         "client_secret": client_secret,
         "refresh_token": refresh_token,
-        "grant_type":    "refresh_token",
-    }, timeout=30)
-        if not resp.ok:
-        print(f"Token error {resp.status_code}: {resp.text}", flush=True)
-    resp.raise_for_status()
-        return resp.json()["access_token"]
-
-def yt_get(access_token: str, endpoint: str, params: dict) -> dict:
-    """GET a YouTube Data API v3 endpoint."""
-    headers = {"Authorization": f"Bearer {access_token}"}
-    resp = requests.get(f"{YOUTUBE_API}/{endpoint}", params=params,
-                        headers=headers, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def yt_post(access_token: str, endpoint: str, body: dict) -> dict:
-    """POST to a YouTube Data API v3 endpoint."""
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type":  "application/json",
+        "grant_type": "refresh_token",
     }
-    resp = requests.post(f"{YOUTUBE_API}/{endpoint}", json=body,
-                         headers=headers, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+
+    resp = requests.post(TOKEN_URL, data=payload, timeout=30)
+    if not resp.ok:
+        print(f"Token request failed: {resp.status_code} {resp.text}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    return resp.json()["access_token"]
 
 
-# ---------------------------------------------------------------------------
-# Core logic
-# ---------------------------------------------------------------------------
-
-def load_state(path: str) -> dict:
-    p = Path(path)
-    if p.exists():
-        return json.loads(p.read_text())
-    return {}
-
-
-def save_state(state: dict, path: str) -> None:
-    Path(path).write_text(json.dumps(state, indent=2))
+def load_state():
+    """Load the set of already-processed video IDs."""
+    if not os.path.exists(STATE_FILE):
+        return set()
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return set(data.get("processed_video_ids", []))
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"Could not read {STATE_FILE}: {exc}", file=sys.stderr)
+        return set()
 
 
-def title_matches(title: str, show: dict) -> bool:
-    """Return True if the title matches any title_filter and no exclude_keyword."""
-    t = title.lower()
-    if not any(f.lower() in t for f in show["title_filters"]):
-        return False
-    if any(e.lower() in t for e in show.get("exclude_keywords", [])):
-        return False
-    return True
+def save_state(processed_ids):
+    """Persist the set of processed video IDs back to disk."""
+    data = {"processed_video_ids": sorted(processed_ids)}
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
 
-def fetch_recent_uploads(access_token: str, uploads_playlist_id: str,
-                         max_results: int = 50) -> list[dict]:
-    """Return up to max_results recent items from an uploads playlist."""
-    items, page_token = [], None
+def fetch_uploads(access_token, uploads_playlist_id):
+    """Return all items from a show's uploads playlist (paginated)."""
+    headers = {"Authorization": f"Bearer {access_token}"}
+    items = []
+    page_token = None
+
     while True:
         params = {
-            "part":       "snippet",
+            "part": "snippet,contentDetails",
             "playlistId": uploads_playlist_id,
             "maxResults": 50,
         }
         if page_token:
             params["pageToken"] = page_token
-        data = yt_get(access_token, "playlistItems", params)
-        items.extend(data.get("items", []))
-        if len(items) >= max_results:
+
+        resp = requests.get(
+            PLAYLIST_ITEMS_URL, headers=headers, params=params, timeout=30
+        )
+        if not resp.ok:
+            print(f"Failed to fetch uploads for {uploads_playlist_id}: "
+                  f"{resp.status_code} {resp.text}", file=sys.stderr)
             break
-        page_token = data.get("nextPageToken")
+
+        body = resp.json()
+        items.extend(body.get("items", []))
+
+        page_token = body.get("nextPageToken")
         if not page_token:
             break
-    return items[:max_results]
+
+    return items
 
 
-def add_to_playlist(access_token: str, playlist_id: str, video_id: str) -> None:
-    """Insert a video at position 0 (top) of the target playlist."""
-    yt_post(access_token, "playlistItems", {
+def title_matches(title, title_filters, exclude_keywords):
+    """Check title against include filters and exclude keywords."""
+    lowered = title.lower()
+
+    included = any(f.lower() in lowered for f in title_filters)
+    if not included:
+        return False
+
+    excluded = any(k.lower() in lowered for k in exclude_keywords)
+    if excluded:
+        return False
+
+    return True
+
+
+def add_to_playlist(access_token, target_playlist_id, video_id):
+    """Insert a video at position 0 of the target playlist."""
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+    params = {"part": "snippet"}
+    body = {
         "snippet": {
-            "playlistId": playlist_id,
+            "playlistId": target_playlist_id,
+            "position": 0,
             "resourceId": {
-                "kind":    "youtube#video",
+                "kind": "youtube#video",
                 "videoId": video_id,
             },
-            "position": 0,
         }
-    })
+    }
+
+    resp = requests.post(
+        PLAYLIST_ITEMS_URL,
+        headers=headers,
+        params=params,
+        json=body,
+        timeout=30,
+    )
+    if not resp.ok:
+        print(f"Failed to add {video_id} to {target_playlist_id}: "
+              f"{resp.status_code} {resp.text}", file=sys.stderr)
+        return False
+
+    return True
 
 
-def run_once(access_token: str, state: dict) -> dict:
-    """One full pass: check all shows, add new monologues, return updated state."""
-    for show in SHOWS:
-        name        = show["name"]
-        playlist_id = show.get("playlist_id", "")
-        if not playlist_id:
-            log.warning("%s: no playlist_id configured, skipping", name)
+def process_show(access_token, show, processed_ids):
+    """Process a single show; returns count of newly added videos."""
+    name = show.get("name", show.get("uploads_playlist_id", "unknown"))
+    title_filters = show.get("title_filters", [])
+    exclude_keywords = show.get("exclude_keywords", [])
+    uploads_playlist_id = show["uploads_playlist_id"]
+    target_playlist_id = show["target_playlist_id"]
+
+    print(f"Processing show: {name}")
+    items = fetch_uploads(access_token, uploads_playlist_id)
+
+    added = 0
+    for item in items:
+        snippet = item.get("snippet", {})
+        title = snippet.get("title", "")
+
+        resource = snippet.get("resourceId", {})
+        video_id = resource.get("videoId")
+        if not video_id:
+            video_id = item.get("contentDetails", {}).get("videoId")
+        if not video_id:
             continue
 
-        log.info("Checking %s ...", name)
-        seen = set(state.get(name, []))
-
-        try:
-            items = fetch_recent_uploads(access_token, show["uploads_playlist"])
-        except Exception as exc:
-            log.error("%s: failed to fetch uploads — %s", name, exc)
+        if video_id in processed_ids:
             continue
 
-        added = 0
-        # Process oldest-first so newest ends up at position 0
-        for item in reversed(items):
-            snippet  = item.get("snippet", {})
-            video_id = snippet.get("resourceId", {}).get("videoId", "")
-            title    = snippet.get("title", "")
+        if not title_matches(title, title_filters, exclude_keywords):
+            processed_ids.add(video_id)
+            continue
 
-            if not video_id or video_id in seen:
-                continue
-            if not title_matches(title, show):
-                continue
+        if add_to_playlist(access_token, target_playlist_id, video_id):
+            print(f"  Added: {title} ({video_id})")
+            added += 1
 
-            try:
-                add_to_playlist(access_token, playlist_id, video_id)
-                seen.add(video_id)
-                added += 1
-                log.info("  + %s  [%s]", title, video_id)
-            except Exception as exc:
-                log.error("  ! Failed to add %s: %s", video_id, exc)
+        processed_ids.add(video_id)
 
-        state[name] = list(seen)
-        log.info("%s: added %d new clip(s)", name, added)
-
-    return state
+    return added
 
 
-def main() -> None:
-    missing = [v for v in ("YOUTUBE_CLIENT_ID", "YOUTUBE_CLIENT_SECRET",
-                           "YOUTUBE_REFRESH_TOKEN")
-               if not os.environ.get(v)]
-    if missing:
-        log.error("Missing environment variables: %s", ", ".join(missing))
-        sys.exit(1)
-
-    state = load_state(STATE_FILE)
+def main():
     access_token = get_access_token()
-    state = run_once(access_token, state)
-    save_state(state, STATE_FILE)
-    log.info("Done.")
+    processed_ids = load_state()
+
+    total_added = 0
+    for show in SHOWS:
+        total_added += process_show(access_token, show, processed_ids)
+
+    save_state(processed_ids)
+    print(f"Done. {total_added} new video(s) added. "
+          f"{len(processed_ids)} total tracked.")
 
 
 if __name__ == "__main__":
